@@ -6,6 +6,7 @@ import asyncio
 import aiohttp
 import aiofiles
 import hashlib
+from typing import List, Dict, Union
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
 
