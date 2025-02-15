@@ -6,7 +6,7 @@ import asyncio
 import aiohttp
 import aiofiles
 import hashlib
-from typing import List, Dict, Union
+from typing import List, Dict
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
 
@@ -43,10 +43,10 @@ SUPPORTED_TYPES = {
 }
 
 # Environment variables
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID"))
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER_ID = int(os.environ["OWNER_ID"])
 
 class URLTrackerBot:
     def __init__(self):
@@ -60,7 +60,7 @@ class URLTrackerBot:
         self.data = {
             'users': {},
             'sudo': [],
-            'authorized': []
+            'authorized': [OWNER_ID]  # Auto-authorize owner
         }
         
         # Register handlers
@@ -70,13 +70,13 @@ class URLTrackerBot:
         self.app.add_handler(MessageHandler(self.docs_handler, filters.command("documents")))
         self.app.add_handler(MessageHandler(self.sudo_handler, filters.command("addsudo") | filters.command("removesudo")))
         self.app.add_handler(MessageHandler(self.auth_handler, filters.command("authchat") | filters.command("unauthchat")))
-        self.app.add_handler(CallbackQueryHandler(self.nightmode_handler, pattern=r"^nightmode_"))
+        self.app.add_handler(CallbackQueryHandler(self.nightmode_handler, filters.regex(r"^nightmode_")))
 
     async def load_data(self):
         """Load persistent data"""
         try:
             async with aiofiles.open('data.json', 'r') as f:
-                self.data = json.loads(await f.read())
+                self.data.update(json.loads(await f.read()))
         except (FileNotFoundError, json.JSONDecodeError):
             pass
 
@@ -94,13 +94,13 @@ class URLTrackerBot:
     def is_authorized(self, chat_id: int) -> bool:
         return chat_id in self.data['authorized'] or self.is_owner(chat_id)
 
-    async def split_send(self, chat_id: int, text: str):
-        """Split and send long messages"""
+    async def send_split_messages(self, chat_id: int, text: str):
+        """Send long messages in chunks"""
         for i in range(0, len(text), MAX_MESSAGE_LENGTH):
             await self.app.send_message(chat_id, text[i:i+MAX_MESSAGE_LENGTH])
 
     async def extract_resources(self, url: str) -> List[dict]:
-        """Extract all resources from webpage"""
+        """Extract resources from webpage"""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
@@ -130,74 +130,76 @@ class URLTrackerBot:
             return []
 
     async def check_updates(self, url: str, user_id: int):
-        """Check for URL updates and notify user"""
+        """Check for updates and notify user"""
         try:
             async with aiohttp.ClientSession() as session:
-                # Get current content hash
                 async with session.get(url) as resp:
                     content = await resp.read()
                     current_hash = hashlib.sha256(content).hexdigest()
                 
-                # Compare with stored hash
                 user_key = str(user_id)
                 if url not in self.data['users'].get(user_key, {}):
                     return
                 
                 stored_hash = self.data['users'][user_key][url]['hash']
                 if stored_hash != current_hash:
-                    # Send text document
-                    resources = await self.extract_resources(url)
-                    text_content = f"🔔 Update detected for {url}\n\n"
-                    text_content += "\n".join([f"{r['type'].title()}: {r['name']}\n{r['url']}" for r in resources])
-                    
-                    if len(text_content) > MAX_MESSAGE_LENGTH:
-                        async with aiofiles.open('update.txt', 'w') as f:
-                            await f.write(text_content)
-                        await self.app.send_document(user_id, 'update.txt')
-                        os.remove('update.txt')
-                    else:
-                        await self.split_send(user_id, text_content)
-                    
-                    # Send media files
-                    for resource in resources:
-                        try:
-                            async with session.get(resource['url']) as r:
-                                if r.status == 200 and int(r.headers.get('Content-Length', 0)) <= MAX_FILE_SIZE:
-                                    file_content = await r.read()
-                                    send_method = {
-                                        'image': self.app.send_photo,
-                                        'video': self.app.send_video,
-                                        'audio': self.app.send_audio
-                                    }.get(resource['type'], self.app.send_document)
-                                    
-                                    await send_method(
-                                        user_id,
-                                        **{resource['type']: file_content},
-                                        caption=resource['name']
-                                    )
-                        except Exception as e:
-                            logger.error(f"Failed to send {resource['type']}: {e}")
-                    
-                    # Update stored hash
+                    # Send updates
+                    await self.send_updates(user_id, url, content)
                     self.data['users'][user_key][url]['hash'] = current_hash
                     await self.save_data()
                     
         except Exception as e:
             logger.error(f"Update check failed: {e}")
 
+    async def send_updates(self, user_id: int, url: str, content: bytes):
+        """Send detected updates to user"""
+        try:
+            resources = await self.extract_resources(url)
+            text_content = f"🔔 Update detected for {url}\n\nResources:\n"
+            text_content += "\n".join([f"{r['type'].title()}: {r['name']}\n{r['url']}" for r in resources])
+            
+            # Send text document
+            async with aiofiles.open('update.txt', 'wb') as f:
+                await f.write(text_content.encode())
+            await self.app.send_document(user_id, 'update.txt')
+            os.remove('update.txt')
+            
+            # Send media files
+            for resource in resources:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(resource['url']) as resp:
+                            if resp.status == 200 and int(resp.headers.get('Content-Length', 0)) <= MAX_FILE_SIZE:
+                                file_content = await resp.read()
+                                send_method = {
+                                    'image': self.app.send_photo,
+                                    'video': self.app.send_video,
+                                    'audio': self.app.send_audio
+                                }.get(resource['type'], self.app.send_document)
+                                
+                                await send_method(
+                                    user_id,
+                                    **{resource['type']: file_content},
+                                    caption=resource['name']
+                                )
+                except Exception as e:
+                    logger.error(f"Failed to send {resource['type']}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Update notification failed: {e}")
+
     async def track_handler(self, client: Client, message: Message):
         """Handle /track command"""
-        if not self.is_authorized(message.chat.id):
-            return await message.reply("❌ You're not authorized!")
-        
         try:
-            # Parse command: /track "Site Name" url interval
-            match = re.match(r'/track\s+"(.+?)"\s+(\S+)\s+(\d+)', message.text)
-            if not match:
-                return await message.reply("❌ Invalid format. Use: /track \"Site Name\" url interval")
+            # Basic command format: /track <name> <url> <interval>
+            if not self.is_authorized(message.chat.id):
+                return await message.reply("❌ You're not authorized!")
             
-            name, url, interval = match.groups()
-            interval = int(interval)
+            parts = message.text.split(maxsplit=3)
+            if len(parts) < 4:
+                return await message.reply("Usage: /track <name> <url> <interval>")
+            
+            _, name, url, interval = parts
             parsed = urlparse(url)
             if not parsed.scheme:
                 url = f"http://{url}"
@@ -207,19 +209,13 @@ class URLTrackerBot:
             user_key = str(user_id)
             self.data['users'].setdefault(user_key, {})[url] = {
                 'name': name,
-                'interval': interval,
+                'interval': int(interval),
                 'hash': '',
                 'nightmode': False
             }
             
             # Schedule job
-            trigger = IntervalTrigger(minutes=interval)
-            if self.data['users'][user_key][url]['nightmode']:
-                trigger = AndTrigger([
-                    trigger,
-                    CronTrigger(hour='6-22', timezone=TIMEZONE)
-                ])
-            
+            trigger = IntervalTrigger(minutes=int(interval))
             self.scheduler.add_job(
                 self.check_updates,
                 trigger=trigger,
@@ -228,7 +224,7 @@ class URLTrackerBot:
                 replace_existing=True
             )
             
-            # Send response with controls
+            # Send response
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "🌙 Toggle Night Mode",
@@ -247,16 +243,18 @@ class URLTrackerBot:
 
     async def untrack_handler(self, client: Client, message: Message):
         """Handle /untrack command"""
-        if not self.is_authorized(message.chat.id):
-            return
-        
         try:
+            if not self.is_authorized(message.chat.id):
+                return
+            
+            if len(message.command) < 2:
+                return await message.reply("Usage: /untrack <url>")
+            
             url = message.command[1]
             user_id = message.from_user.id
             user_key = str(user_id)
             
             if url in self.data['users'].get(user_key, {}):
-                # Remove job and data
                 self.scheduler.remove_job(f"{user_id}_{url}")
                 del self.data['users'][user_key][url]
                 await self.save_data()
@@ -264,37 +262,44 @@ class URLTrackerBot:
             else:
                 await message.reply("URL not found in your tracked list")
                 
-        except IndexError:
-            await message.reply("Usage: /untrack url")
+        except Exception as e:
+            await message.reply(f"❌ Error: {str(e)}")
 
     async def list_handler(self, client: Client, message: Message):
         """Handle /list command"""
-        if not self.is_authorized(message.chat.id):
-            return
-        
-        user_id = message.from_user.id
-        tracked = self.data['users'].get(str(user_id), {})
-        
-        if not tracked:
-            return await message.reply("You're not tracking any URLs")
-        
-        response = "📋 Your Tracked URLs:\n\n"
-        for url, data in tracked.items():
-            response += (
-                f"• {data['name']}\n"
-                f"URL: {url}\n"
-                f"Interval: {data['interval']}m\n"
-                f"Night Mode: {'ON' if data['nightmode'] else 'OFF'}\n\n"
-            )
-        
-        await self.split_send(message.chat.id, response)
+        try:
+            if not self.is_authorized(message.chat.id):
+                return
+            
+            user_id = message.from_user.id
+            tracked = self.data['users'].get(str(user_id), {})
+            
+            if not tracked:
+                return await message.reply("You're not tracking any URLs")
+            
+            response = "📋 Your Tracked URLs:\n\n"
+            for url, data in tracked.items():
+                response += (
+                    f"• {data['name']}\n"
+                    f"URL: {url}\n"
+                    f"Interval: {data['interval']}m\n"
+                    f"Night Mode: {'ON' if data['nightmode'] else 'OFF'}\n\n"
+                )
+            
+            await self.send_split_messages(message.chat.id, response)
+            
+        except Exception as e:
+            await message.reply(f"❌ Error: {str(e)}")
 
     async def docs_handler(self, client: Client, message: Message):
         """Handle /documents command"""
-        if not self.is_authorized(message.chat.id):
-            return
-        
         try:
+            if not self.is_authorized(message.chat.id):
+                return
+            
+            if len(message.command) < 2:
+                return await message.reply("Usage: /documents <url>")
+            
             url = message.command[1]
             user_id = message.from_user.id
             user_data = self.data['users'].get(str(user_id), {})
@@ -302,25 +307,27 @@ class URLTrackerBot:
             if url not in user_data:
                 return await message.reply("URL not tracked")
             
-            # Generate and send document
             resources = await self.extract_resources(url)
             text_content = f"Resources for {url}:\n\n"
             text_content += "\n".join([f"{r['type'].title()}: {r['name']}\n{r['url']}" for r in resources])
             
-            async with aiofiles.open('resources.txt', 'w') as f:
-                await f.write(text_content)
+            async with aiofiles.open('resources.txt', 'wb') as f:
+                await f.write(text_content.encode())
             await self.app.send_document(message.chat.id, 'resources.txt')
             os.remove('resources.txt')
             
-        except IndexError:
-            await message.reply("Usage: /documents url")
+        except Exception as e:
+            await message.reply(f"❌ Error: {str(e)}")
 
     async def sudo_handler(self, client: Client, message: Message):
-        """Handle sudo user management"""
-        if not self.is_owner(message.from_user.id):
-            return await message.reply("❌ Owner only command!")
-        
+        """Handle sudo commands"""
         try:
+            if not self.is_owner(message.from_user.id):
+                return await message.reply("❌ Owner only command!")
+            
+            if len(message.command) < 2:
+                return await message.reply("Usage: /addsudo <user_id> or /removesudo <user_id>")
+            
             cmd = message.command[0]
             user_id = int(message.command[1])
             
@@ -339,15 +346,15 @@ class URLTrackerBot:
             
             await self.save_data()
             
-        except (IndexError, ValueError):
-            await message.reply("Usage: /addsudo user_id or /removesudo user_id")
+        except Exception as e:
+            await message.reply(f"❌ Error: {str(e)}")
 
     async def auth_handler(self, client: Client, message: Message):
         """Handle chat authorization"""
-        if not self.is_owner(message.from_user.id):
-            return
-        
         try:
+            if not self.is_owner(message.from_user.id):
+                return
+            
             cmd = message.command[0]
             chat_id = message.chat.id
             
@@ -367,41 +374,47 @@ class URLTrackerBot:
             await self.save_data()
             
         except Exception as e:
-            logger.error(f"Auth error: {e}")
+            await message.reply(f"❌ Error: {str(e)}")
 
     async def nightmode_handler(self, client: Client, query: CallbackQuery):
-        """Toggle night mode for tracking"""
-        _, user_id, url = query.data.split('_')
-        user_id = int(user_id)
-        user_key = str(user_id)
-        
-        if user_key not in self.data['users'] or url not in self.data['users'][user_key]:
-            return await query.answer("URL not found!", show_alert=True)
-        
-        # Toggle night mode
-        current = self.data['users'][user_key][url]['nightmode']
-        self.data['users'][user_key][url]['nightmode'] = not current
-        
-        # Update job trigger
-        job = self.scheduler.get_job(f"{user_id}_{url}")
-        if job:
-            interval = self.data['users'][user_key][url]['interval']
-            trigger = IntervalTrigger(minutes=interval)
+        """Handle night mode toggle"""
+        try:
+            data = query.data.split('_')
+            user_id = int(data[1])
+            url = data[2]
+            user_key = str(user_id)
             
-            if not current:
-                trigger = AndTrigger([
-                    trigger,
-                    CronTrigger(hour='6-22', timezone=TIMEZONE)
-                ])
+            if url not in self.data['users'].get(user_key, {}):
+                return await query.answer("URL not found!", show_alert=True)
             
-            self.scheduler.reschedule_job(job.id, trigger=trigger)
-            await query.edit_message_text(
-                f"🌙 Night mode {'enabled' if not current else 'disabled'}\n"
-                f"for {self.data['users'][user_key][url]['name']}"
-            )
-            await self.save_data()
-        
-        await query.answer()
+            # Toggle night mode
+            current = self.data['users'][user_key][url]['nightmode']
+            self.data['users'][user_key][url]['nightmode'] = not current
+            
+            # Update job trigger
+            job = self.scheduler.get_job(f"{user_id}_{url}")
+            if job:
+                interval = self.data['users'][user_key][url]['interval']
+                trigger = IntervalTrigger(minutes=interval)
+                
+                if not current:
+                    trigger = AndTrigger([
+                        trigger,
+                        CronTrigger(hour='6-22', timezone=TIMEZONE)
+                    ])
+                
+                self.scheduler.reschedule_job(job.id, trigger=trigger)
+                await query.edit_message_text(
+                    f"🌙 Night mode {'enabled' if not current else 'disabled'}\n"
+                    f"for {self.data['users'][user_key][url]['name']}"
+                )
+                await self.save_data()
+            
+            await query.answer()
+            
+        except Exception as e:
+            logger.error(f"Night mode error: {e}")
+            await query.answer("Error occurred!", show_alert=True)
 
     async def run(self):
         """Start the bot"""
