@@ -9,7 +9,7 @@ import hashlib
 from datetime import datetime
 from typing import Dict, List, Tuple
 from urllib.parse import urlparse
-
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     Message,
