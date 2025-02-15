@@ -430,7 +430,7 @@ class URLTrackerBot:
                 self.scheduler.reschedule_job(job.id, trigger=trigger)
                 await query.edit_message_text(
                     f"🌙 Night mode {'enabled' if not current else 'disabled'}\n"
-                    f"for {self.data.data['tracked'][user_key][url]['name']"
+                    f"for {self.data.data['tracked'][user_key][url]['name']}"
                 )
                 self.data.save_data()
             
